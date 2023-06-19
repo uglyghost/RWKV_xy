@@ -1,34 +1,26 @@
+########################################################################################################
+# The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
+########################################################################################################
+
 import math, os
-import torch
+import numpy as np
 import logging
+import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.cpp_extension import load
 
 try:
     from deepspeed.ops.adam import FusedAdam
 except:
-    pass
+    pass  # some poor windows users cant install deepspeed
 
 logger = logging.getLogger(__name__)
 
 RWKV_HEAD_QK_DIM = 0
 print(f'\nRWKV_HEAD_QK_DIM {RWKV_HEAD_QK_DIM}\n')
 
-# Define a constant for the maximum tensor dimension.
-# If your context length exceeds this, you may need to increase this value.
-# Note that larger values may consume more VRAM.
-T_MAX = 1024
-
-# Compile and load the CUDA kernel. This kernel will be used for the custom WKV operation.
-wkv_cuda = load(name="wkv", sources=["cuda/wkv_op.cpp", "cuda/wkv_cuda.cu"],
-                verbose=True, extra_cuda_cflags=['-res-usage', '--use_fast_math', '-O3',  f'-DTmax={T_MAX}'])  # '--maxrregcount 60', '-Xptxas -O3',
-
 
 class L2Wrap(torch.autograd.Function):
-    """
-    A wrapper for the L2 loss function. It encourages the logits to be close to 0.
-    """
     @staticmethod
     def forward(ctx, loss, y):
         ctx.save_for_backward(y)
@@ -37,6 +29,7 @@ class L2Wrap(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         y = ctx.saved_tensors[0]
+        # to encourage the logits to be close to 0
         factor = 1e-4 / (y.shape[0] * y.shape[1])
         maxx, ids = torch.max(y, -1, keepdim=True)
         gy = torch.zeros_like(y)
@@ -44,70 +37,83 @@ class L2Wrap(torch.autograd.Function):
         return (grad_output, gy)
 
 
+########################################################################################################
+# CUDA Kernel
+########################################################################################################
+
+T_MAX = 1024  # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
+# it's possible to go beyond CUDA limitations if you slice the ctx and pass the hidden state in each slice
+
+from torch.utils.cpp_extension import load
+
+wkv_cuda = load(name="wkv", sources=["cuda/wkv_op.cpp", "cuda/wkv_cuda.cu"],
+                verbose=True, extra_cuda_cflags=['-res-usage', '--use_fast_math', '-O3',
+                                                 f'-DTmax={T_MAX}'])  # '--maxrregcount 60', '-Xptxas -O3',
+
+
 class WKV(torch.autograd.Function):
-    """
-    A custom autograd function for the WKV operation.
-    """
     @staticmethod
     def forward(ctx, B, T, C, w, u, k, v):
-        # Some assertions to ensure the input dimensions are as expected
-        assert T <= T_MAX
-        assert B * C % min(C, 1024) == 0
-        # Ensure contiguous tensors and apply any necessary datatype conversions
-        w, u, k, v = [-torch.exp(t.contiguous().float()) if '32' not in os.environ['RWKV_FLOAT_MODE'] else -torch.exp(t.contiguous()) for t in [w, u, k, v]]
-        # Save tensors for use in the backward pass
-        ctx.save_for_backward(w, u, k, v)
         ctx.B = B
         ctx.T = T
         ctx.C = C
-        # Initialize the output tensor and apply the CUDA kernel
+        assert T <= T_MAX
+        assert B * C % min(C, 1024) == 0
+        if '32' in os.environ['RWKV_FLOAT_MODE']:
+            w = -torch.exp(w.contiguous())
+            u = u.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+        else:
+            w = -torch.exp(w.float().contiguous())
+            u = u.float().contiguous()
+            k = k.float().contiguous()
+            v = v.float().contiguous()
+        ctx.save_for_backward(w, u, k, v)
         y = torch.empty((B, T, C), device='cuda', memory_format=torch.contiguous_format)
         wkv_cuda.forward(B, T, C, w, u, k, v, y)
-        # Apply any necessary datatype conversions to the output
-        if os.environ['RWKV_FLOAT_MODE'] == 'fp16':
+        if '32' in os.environ['RWKV_FLOAT_MODE']:
+            return y
+        elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
             return y.half()
         elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
             return y.bfloat16()
-        else:
-            return y
 
     @staticmethod
     def backward(ctx, gy):
-        # Retrieve the saved tensors and dimensions
-        B, T, C = ctx.B, ctx.T, ctx.C
-        w, u, k, v = ctx.saved_tensors
+        B = ctx.B
+        T = ctx.T
+        C = ctx.C
         assert T <= T_MAX
         assert B * C % min(C, 1024) == 0
-        ## This part of the code is too long. I will continue with the optimization and comments in the next message.
-        # Initialize the gradients
-        gw, gu, gk, gv = [torch.zeros((B, *t.shape[1:]), device='cuda').contiguous() for t in [w, u, k, v]]
-        # Convert gy to float if necessary and ensure it's contiguous
-        gy = gy.float().contiguous() if '32' not in os.environ['RWKV_FLOAT_MODE'] else gy.contiguous()
-        # Apply the CUDA kernel for the backward pass
-        wkv_cuda.backward(B, T, C, w, u, k, v, gy, gw, gu, gk, gv)
-        # Sum the gradients over the batch dimension
-        gw, gu = [torch.sum(g, dim=0) for g in [gw, gu]]
-        # Convert the gradients to the appropriate datatype
-        if os.environ['RWKV_FLOAT_MODE'] == 'fp16':
+        w, u, k, v = ctx.saved_tensors
+        gw = torch.zeros((B, C), device='cuda').contiguous()
+        gu = torch.zeros((B, C), device='cuda').contiguous()
+        gk = torch.zeros((B, T, C), device='cuda').contiguous()
+        gv = torch.zeros((B, T, C), device='cuda').contiguous()
+        if '32' in os.environ['RWKV_FLOAT_MODE']:
+            wkv_cuda.backward(B, T, C, w, u, k, v, gy.contiguous(), gw, gu, gk, gv)
+        else:
+            wkv_cuda.backward(B, T, C, w, u, k, v, gy.float().contiguous(), gw, gu, gk, gv)
+        gw = torch.sum(gw, dim=0)
+        gu = torch.sum(gu, dim=0)
+        if '32' in os.environ['RWKV_FLOAT_MODE']:
+            return (None, None, None, gw, gu, gk, gv)
+        elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
             return (None, None, None, gw.half(), gu.half(), gk.half(), gv.half())
         elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
             return (None, None, None, gw.bfloat16(), gu.bfloat16(), gk.bfloat16(), gv.bfloat16())
-        else:
-            return (None, None, None, gw, gu, gk, gv)
 
 
 def RUN_CUDA(B, T, C, w, u, k, v):
-    """
-    A convenience function to apply the WKV operation on CUDA tensors.
-    """
     return WKV.apply(B, T, C, w.cuda(), u.cuda(), k.cuda(), v.cuda())
 
 
-def RWKV_Init(model, args):
-    """
-    Perform fancy initialization for all linear & embedding layers in the model.
-    This should only be run once, for a single GPU. For multi-GPU training, initialize on one GPU and then save and load the checkpoint.
-    """
+########################################################################################################
+# RWKV: RWKV Time-mix + RWKV Channel-mix
+########################################################################################################
+
+def RWKV_Init(model, args):  # fancy initialization of all lin & emb layer in the model
     print("\n[--> first run, init model params (very slow for large models) <--]")
     print("[so you shall only do it for 1 single GPU and save the checkpt and load it when using multiple GPU]\n")
 
@@ -149,6 +155,8 @@ def RWKV_Init(model, args):
 
             if hasattr(m, "scale_init"):
                 scale = m.scale_init
+
+            # print(f"{str(shape[0]).ljust(5)} {str(shape[1]).ljust(5)} {str(scale).ljust(4)} {name}")
 
             gain *= scale
             if scale == -999:
