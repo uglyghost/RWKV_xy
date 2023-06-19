@@ -1,7 +1,6 @@
 # RWKV_xy
 
-RWKV_xy is a test project, focusing primarily on C++ and CUDA programming and applications.
-
+RWKV_xy is a test project, focusing primarily on RWKV.
 ## Environment Setup
 
 Please follow these steps to install and setup your environment:
