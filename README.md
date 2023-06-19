@@ -13,7 +13,7 @@ RWKV_xy 是一个测试项目，主要涉及C++和CUDA的编程和应用。
 
 ### 执行脚本
 
-使用"x64 native tools command prompt"（在开始菜单中找到）运行`train.py`。
+使用"x64 native tools command prompt"（在开始菜单中找到）运行`train.py` or `main.py`。
 
 ### 环境变量设置
 
