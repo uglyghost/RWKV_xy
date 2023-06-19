@@ -22,7 +22,7 @@ T_MAX = 1024
 
 # Compile and load the CUDA kernel. This kernel will be used for the custom WKV operation.
 wkv_cuda = load(name="wkv", sources=["cuda/wkv_op.cpp", "cuda/wkv_cuda.cu"],
-                verbose=True, extra_cuda_cflags=['-res-usage', '--maxrregcount 60', '--use_fast_math', '-O3', '-Xptxas -O3', f'-DTmax={T_MAX}'])
+                verbose=True, extra_cuda_cflags=['-res-usage', '--use_fast_math', '-O3',  f'-DTmax={T_MAX}'])  # '--maxrregcount 60', '-Xptxas -O3',
 
 
 class L2Wrap(torch.autograd.Function):
