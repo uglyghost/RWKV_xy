@@ -20,7 +20,7 @@ Run `train.py` using the "x64 native tools command prompt", which can be found i
 On Windows 11, please set your environment variables as follows:
 
 - Set `LD_LIBRARY_PATH` to `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7\lib\x64`
-- Set `PATH` to `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.35.32215\bin\Hostx64\x64`
+- Add `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.35.32215\bin\Hostx64\x64` to `PATH`
 
 ## C++ Code
 
