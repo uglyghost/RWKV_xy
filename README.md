@@ -13,7 +13,7 @@ Please follow these steps to install and setup your environment:
 
 ### Script Execution
 
-Run `train.py` using the "x64 native tools command prompt", which can be found in your start menu.
+Run `main.py` or `train.py` using the "x64 native tools command prompt", which can be found in your start menu.
 
 ### Setting Environment Variables
 
