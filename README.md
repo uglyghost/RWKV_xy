@@ -1,6 +1,10 @@
 # RWKV_xy
 
 RWKV_xy is a test project, focusing primarily on RWKV.
+
+## The first step make the code run!
+![image](https://github.com/uglyghost/RWKV_xy/assets/15159177/1a15ad4a-6e34-42b5-922e-1d72f2d42de0)
+
 ## Environment Setup
 
 Please follow these steps to install and setup your environment:
@@ -20,9 +24,6 @@ On Windows 11, please set your environment variables as follows:
 
 - Set `LD_LIBRARY_PATH` to `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7\lib\x64`
 - Add `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.35.32215\bin\Hostx64\x64` to `PATH`
-
-## The first step make the code run!
-![image](https://github.com/uglyghost/RWKV_xy/assets/15159177/1a15ad4a-6e34-42b5-922e-1d72f2d42de0)
 
 
 ## C++ Code
