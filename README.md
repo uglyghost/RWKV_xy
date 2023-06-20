@@ -5,6 +5,9 @@ RWKV_xy is a test project, focusing primarily on RWKV.
 ## The first step make the code run!
 ![image](https://github.com/uglyghost/RWKV_xy/assets/15159177/1a15ad4a-6e34-42b5-922e-1d72f2d42de0)
 
+## The second step optimize the model framework!
+-_-
+
 ## Environment Setup
 
 Please follow these steps to install and setup your environment:
