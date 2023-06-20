@@ -48,7 +48,7 @@ from torch.utils.cpp_extension import load
 
 wkv_cuda = load(name="wkv", sources=["cuda/wkv_op.cpp", "cuda/wkv_cuda.cu"],
                 verbose=True, extra_cuda_cflags=['-res-usage', '--use_fast_math', '-O3',
-                                                 f'-DTmax={T_MAX}'])  # '--maxrregcount 60', '-Xptxas -O3',
+                                                 '--maxrregcount=60', '-Xptxas=-O3', f'-DTmax={T_MAX}'])  #
 
 
 class WKV(torch.autograd.Function):
