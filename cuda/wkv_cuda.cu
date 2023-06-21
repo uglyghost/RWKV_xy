@@ -6,6 +6,9 @@
 // Defines a constant for minimum value
 #define MIN_VALUE (-1e38)
 
+// 这个文件是原论文公式（14）的cuda实现
+// 维度并行计算，字串行计算
+
 // CUDA Kernel for the forward pass of a computation
 // B: Batch Size
 // T: the dimensionality of the embeddings
@@ -16,8 +19,13 @@
 // _v: v_t
 // _y: output
 template <typename F>
-__global__ void kernel_forward(const int B, const int T, const int C,
-                               const F *__restrict__ const _w, const F *__restrict__ const _u, const F *__restrict__ const _k, const F *__restrict__ const _v,
+__global__ void kernel_forward(const int B,
+                                const int T,
+                                const int C,
+                               const F *__restrict__ const _w,
+                               const F *__restrict__ const _u,
+                               const F *__restrict__ const _k,
+                               const F *__restrict__ const _v,
                                F *__restrict__ const _y) {
     // Calculate the index for each thread
     // blockIdx: the ID of block

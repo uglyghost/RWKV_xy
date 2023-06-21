@@ -297,20 +297,25 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         self.receptance = nn.Linear(config.n_embd, config.n_embd, bias=False)  # 对应公式(16) 中的 W_r
         self.value = nn.Linear(hidden_sz, config.n_embd, bias=False)  # 对应公式(18) 中的 W_v
 
+        # todo 看不懂
         self.value.scale_init = 0
         self.receptance.scale_init = 0
 
     @torch.jit.script_method
     def forward(self, x):
-        xx = self.time_shift(x)
-        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
-        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
+        xx = self.time_shift(x)  # 公式（16-17）中的 X_t-1
+        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)  # 公式（17）中的 括号部分
+        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)  # 公式（16）中的 括号部分
 
-        k = self.key(xk)
-        k = torch.square(torch.relu(k))
-        kv = self.value(k)
-
-        rkv = torch.sigmoid(self.receptance(xr)) * kv
+        k = self.key(xk)  # 公式（17）中的结果
+        k = torch.square(torch.relu(k))  # 公式（18）中的 max(k_t,0)的平方
+        kv = self.value(k)  # 公式（18）中的第二个括号部分
+        """
+        self.receptance(xr) 为 公式（16）中的r_t
+        torch.sigmoid(self.receptance(xr))  为 公式（18）中的 点乘 前部分
+        rkv 为 公式（18）中的结果
+        """
+        rkv = torch.sigmoid(self.receptance(xr)) * kv  # 公式（18）中
         return rkv
 
 
