@@ -14,6 +14,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+local_env = os.environ.copy()
+local_env["PATH"]=r"C:\Users\gy\.conda\envs\torch\Scripts;" + local_env["PATH"]
+os.environ.update(local_env)
+
+
+
 # Set environment variables.
 EXPRESS_PILE_MODE = False
 EXPRESS_PILE_MODEL_NAME = 'RWKV-4-Pile-169M-20220807-8023'
@@ -22,9 +28,14 @@ datafile = "./data/enwik8"
 datafile_encoding = 'utf-8'
 os.environ['VOCAB_SIZE'] = '50277' if EXPRESS_PILE_MODE else '0'
 os.environ['RWKV_NUM_GPUS'] = '1'
-os.environ['RWKV_FLOAT_MODE'] = 'bf16'
+# os.environ['RWKV_FLOAT_MODE'] = 'bf16'
+os.environ['RWKV_FLOAT_MODE'] = 'fp16'
 os.environ['RWKV_DEEPSPEED'] = '0' if int(os.environ['RWKV_NUM_GPUS']) == 1 else '1'
 os.environ['USE_WANDB'] = '0'
+
+
+# print(os.environ['PATH'])
+# exit()
 
 # Set model details.
 EPOCH_BEGIN = 0
@@ -35,7 +46,8 @@ ctx_len = 1024
 model_type = 'RWKV'
 
 # Set batch size and learning rate.
-batch_size = 12 * int(os.environ['RWKV_NUM_GPUS'])
+# batch_size = 12 * int(os.environ['RWKV_NUM_GPUS'])
+batch_size = 1
 lr_init = 2e-5 if EXPRESS_PILE_MODE and EXPRESS_PILE_MODEL_TYPE == 'RWKV-4-Pile-169M' else 8e-4
 lr_final = 1e-5
 n_epoch = 100000 if EXPRESS_PILE_MODE else 500
@@ -56,7 +68,7 @@ warmup_tokens = 50 * ctx_len * batch_size // NUM_GPUS if LOAD_MODEL and EPOCH_BE
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = os.environ['RWKV_FLOAT_MODE'] != 'fp32'
 
-# Load the data.
+# Load the data. 加载数据，随机取
 print(f'loading {datafile_encoding} data... ' + datafile)
 if datafile_encoding == 'binidx':
     train_dataset = CustomDataset(MMapIndexedDataset(datafile), ctx_len, epoch_length_fixed)
@@ -137,7 +149,9 @@ def create_trainer(num_gpus, float_mode, deepspeed):
     """
     Creates the trainer based on the number of GPUs, the desired floating point precision mode, and whether to use deepspeed.
     """
-    precision_modes = {"fp16": 16, "bf16": 'bf16', "32": 32}
+    precision_modes = {"fp16": 16,
+                       "bf16": 'bf16',
+                       "32": 32}
     if deepspeed:
         DEEPSPEED_CFG = set_deepspeed_config(num_gpus, float_mode)
         return Trainer(strategy=DeepSpeedStrategy(config=DEEPSPEED_CFG), devices=num_gpus, accelerator="gpu", precision=precision_modes[float_mode])

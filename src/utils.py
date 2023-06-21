@@ -12,29 +12,34 @@ NUM_GPUS = int(os.getenv('RWKV_NUM_GPUS', 1))
 
 
 class CustomDataset(Dataset):
+    """
+    dataset
+    """
+
     def __init__(self, data, ctx_len, epoch_length_fixed):
         """
         This is a custom PyTorch Dataset class.
         """
-        self.ctx_len = ctx_len
-        self.epoch_length_fixed = epoch_length_fixed
-        self.data = data
-        self.data_type = str(type(self.data))
-        self.vocab_size = int(os.getenv('VOCAB_SIZE', 0))
+        self.ctx_len = ctx_len  # 最大文本长度
+        self.epoch_length_fixed = epoch_length_fixed  # 10000   (10000 // batch_size) * batch_size
+        self.data = data  # 原数据集
+        self.data_type = str(type(self.data))  # 原数据集类型
+        self.vocab_size = int(os.getenv('VOCAB_SIZE', 0))  # 预定义词表大小，默认为 0
 
-        if 'MMapIndexedDataset' in self.data_type or 'numpy' in self.data_type:
-            self.data_size = len(self.data._bin_buffer) // 2 if 'MMapIndexedDataset' in self.data_type else len(self.data)
+        if 'MMapIndexedDataset' in self.data_type or 'numpy' in self.data_type:  # 二进制数据 or numpy数据
+            self.data_size = len(self.data._bin_buffer) // 2 if 'MMapIndexedDataset' in self.data_type else len(
+                self.data)
             print(f'Current vocab size = {self.vocab_size}, data has {self.data_size} tokens.')
-        else:
-            unique_chars = sorted(list(set(data)))
-            self.vocab_size = len(unique_chars)
-            self.stoi = {ch: i for i, ch in enumerate(unique_chars)}
-            self.itos = {i: ch for i, ch in enumerate(unique_chars)}
-            self.data_size = len(self.data)
+        else:  # 文本数据
+            unique_chars = sorted(list(set(data)))  # 去重后排序
+            self.vocab_size = len(unique_chars)  # 词表长度
+            self.stoi = {ch: i for i, ch in enumerate(unique_chars)}  # token to ID
+            self.itos = {i: ch for i, ch in enumerate(unique_chars)}  # ID to token
+            self.data_size = len(self.data)  # 数据集文本长度
             print(f'Data has {self.data_size} tokens, {self.vocab_size} unique.')
             # Save vocab as json file
             with open('vocab.json', "w", encoding="utf-16") as vocab_file:
-                json.dump(self.itos, vocab_file, ensure_ascii=False)
+                json.dump(self.itos, vocab_file, ensure_ascii=False)  # 以json格式存储词表
 
     def __len__(self):
         return self.epoch_length_fixed // NUM_GPUS
@@ -42,16 +47,17 @@ class CustomDataset(Dataset):
     def __getitem__(self, _):
         """
         Returns a random sequence from the dataset.
+        随机从数据集中取一段长度为1024的句子
         """
-        start_idx = np.random.randint(0, self.data_size - (self.ctx_len + 1))
+        start_idx = np.random.randint(0, self.data_size - (self.ctx_len + 1))  # 随机取一个开始id
         if 'MMapIndexedDataset' in self.data_type:
             sequence = self.data.get(idx=0, offset=start_idx, length=self.ctx_len + 1).astype(int)
         elif 'numpy' in self.data_type:
-            sequence = self.data[start_idx:start_idx+self.ctx_len+1]
-        else:
-            sequence = [self.stoi[s] for s in self.data[start_idx:start_idx+self.ctx_len+1]]
-        x = torch.tensor(sequence[:-1], dtype=torch.long)
-        y = torch.tensor(sequence[1:], dtype=torch.long)
+            sequence = self.data[start_idx:start_idx + self.ctx_len + 1]
+        else:  # 取长度为1025的句子，然后转为token id
+            sequence = [self.stoi[s] for s in self.data[start_idx:start_idx + self.ctx_len + 1]]
+        x = torch.tensor(sequence[:-1], dtype=torch.long)  # input id
+        y = torch.tensor(sequence[1:], dtype=torch.long)  # output id
         return x, y
 
 

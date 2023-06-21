@@ -173,82 +173,115 @@ def RWKV_Init(model, args):  # fancy initialization of all lin & emb layer in th
 class RWKV_TimeMix(torch.jit.ScriptModule):
     def __init__(self, config, layer_id):
         super().__init__()
-        self.layer_id = layer_id
-        self.ctx_len = config.ctx_len
-        self.n_embd = config.n_embd
+        self.layer_id = layer_id  # 当前layer id
+        self.ctx_len = config.ctx_len  # 最长文本长度
+        self.n_embd = config.n_embd  # hidden_state 维度
 
-        attn_sz = config.n_embd
+        attn_sz = config.n_embd  # hidden_state 维度
 
+        # todo 附录D中TimeMix的位置编码w、u(mu)、u 的初始化计算方法
         with torch.no_grad():  # fancy init
-            ratio_0_to_1 = (layer_id / (config.n_layer - 1))  # 0 to 1
-            ratio_1_to_almost0 = (1.0 - (layer_id / config.n_layer))  # 1 to ~0
+            """
+            layer_id 是 w_i的 l
+            config.n_layer 是 w_i的 L
+            """
+            ratio_0_to_1 = (layer_id / (config.n_layer - 1))  # 0 to 1   w的  l / (L - 1)
+
+            ratio_1_to_almost0 = (1.0 - (layer_id / config.n_layer))  # 1 to ~0   u(mu)的  1-（l/L）
 
             # fancy time_decay
-            decay_speed = torch.ones(attn_sz)
-            for h in range(attn_sz):
+            decay_speed = torch.ones(attn_sz)  # 维度的位置编码 [hidden_state_size]
+            for h in range(attn_sz):  # 按隐藏维度循环每一个位置
+                """
+                h 对应 （14） 公式中w_i的i 
+                attn_sz - 1  对应 （14） 公式中w_i的 (d-1)
+                ratio_0_to_1  对应 （14） 公式中w_i的 l / (L - 1)
+                """
                 decay_speed[h] = -5 + 8 * (h / (attn_sz - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
             self.time_decay = nn.Parameter(decay_speed)
             # print(layer_id, self.time_decay.flatten()[:3].cpu().numpy(), '...', self.time_decay.flatten()[-3:].cpu().numpy())
 
-            # fancy time_first
+            # fancy time_first 对应 论文中的bonus
+            """
+            [(i + 1) % 3 - 1 for i in range(attn_sz)] 对应 （14） 公式中u 的 ((i+1) mod 3) -1
+            
+            zigzag对应 （14） 公式中u 的 0.5 * ((i+1) mod 3) -1
+            
+            self.time_first 对应 （14） 公式中u
+            """
             zigzag = (torch.tensor([(i + 1) % 3 - 1 for i in range(attn_sz)]) * 0.5)
             self.time_first = nn.Parameter(torch.ones(attn_sz) * math.log(0.3) + zigzag)
 
-            # fancy time_mix
+            # fancy time_mix 对应公式中的(11-13)
             x = torch.ones(1, 1, config.n_embd)
             for i in range(config.n_embd):
+                """
+                config.n_embd 对应 s
+                """
                 x[0, 0, i] = i / config.n_embd
-            self.time_mix_k = nn.Parameter(torch.pow(x, ratio_1_to_almost0))
-            self.time_mix_v = nn.Parameter(torch.pow(x, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)
-            self.time_mix_r = nn.Parameter(torch.pow(x, 0.5 * ratio_1_to_almost0))
+            self.time_mix_k = nn.Parameter(torch.pow(x, ratio_1_to_almost0))  # 对应 U(mu)_ki
+            self.time_mix_v = nn.Parameter(torch.pow(x, ratio_1_to_almost0) + 0.3 * ratio_0_to_1)  # 对应 U(mu)_Vi
+            self.time_mix_r = nn.Parameter(torch.pow(x, 0.5 * ratio_1_to_almost0))  # 对应 U(mu)_ri
 
+        # todo 平移操作利于生成 X_t-1
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
+        # 定义 Wr Wk Wv
         self.key = nn.Linear(config.n_embd, attn_sz, bias=False)
         self.value = nn.Linear(config.n_embd, attn_sz, bias=False)
         self.receptance = nn.Linear(config.n_embd, attn_sz, bias=False)
 
+        # 定义 Wo
         self.output = nn.Linear(attn_sz, config.n_embd, bias=False)
 
+        # todo 不懂
         self.key.scale_init = 0
         self.receptance.scale_init = 0
         self.output.scale_init = 0
 
     @torch.jit.script_method
     def jit_func(self, x):
-
+        """C++ 调用"""
         # Mix x with the previous timestep to produce xk, xv, xr
-        xx = self.time_shift(x)
-        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
-        xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)
-        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)
+        xx = self.time_shift(x)  # X_t-1
+        xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)  # 公式 (12) 中的 括号部分
+        xv = x * self.time_mix_v + xx * (1 - self.time_mix_v)  # 公式 (13) 中的 括号部分
+        xr = x * self.time_mix_r + xx * (1 - self.time_mix_r)  # 公式 (11) 中的 括号部分
 
         # Use xk, xv, xr to produce k, v, r
-        k = self.key(xk)
-        v = self.value(xv)
-        r = self.receptance(xr)
-        sr = torch.sigmoid(r)
+        k = self.key(xk)  # 公式 (12) 中的K_t
+        v = self.value(xv)  # 公式 (13) 中的V_t
+        r = self.receptance(xr)  # 公式 (11) 中的R_t
+        sr = torch.sigmoid(r)  # 公式 (15) 中的sigmoid_Rt
 
         return sr, k, v
 
     def forward(self, x):
-        B, T, C = x.size()  # x = (Batch,Time,Channel)
+        B, T, C = x.size()  # x = (Batch,Time,Channel)  <=>   batch_size sentence_len hidden_size
 
         sr, k, v = self.jit_func(x)
 
+        """
+        RUN_CUDA(B, T, C, self.time_decay, self.time_first, k, v) 对应 公式 (14) 中的wkv_t
+        rwkv 对应 公式 (15) 中的 小括号内容
+        """
         rwkv = sr * RUN_CUDA(B, T, C, self.time_decay, self.time_first, k, v)
-        rwkv = self.output(rwkv)
+
+        rwkv = self.output(rwkv)  # 对应公式 (15)
         return rwkv
 
 
 class RWKV_ChannelMix(torch.jit.ScriptModule):
     def __init__(self, config, layer_id):
         super().__init__()
-        self.layer_id = layer_id
+        self.layer_id = layer_id  # layer id
 
+        # 平移
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
         with torch.no_grad():  # fancy init of time_mix
+            # todo 参考 time mix中的 的位置编码u(mu) 的初始化计算方法
+
             ratio_1_to_almost0 = (1.0 - (layer_id / config.n_layer))  # 1 to ~0
 
             x = torch.ones(1, 1, config.n_embd)
@@ -259,9 +292,10 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
             self.time_mix_r = nn.Parameter(torch.pow(x, ratio_1_to_almost0))
 
         hidden_sz = 4 * config.n_embd
-        self.key = nn.Linear(config.n_embd, hidden_sz, bias=False)
-        self.receptance = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.value = nn.Linear(hidden_sz, config.n_embd, bias=False)
+
+        self.key = nn.Linear(config.n_embd, hidden_sz, bias=False)  # 对应公式(17) 中的 W_k
+        self.receptance = nn.Linear(config.n_embd, config.n_embd, bias=False)  # 对应公式(16) 中的 W_r
+        self.value = nn.Linear(hidden_sz, config.n_embd, bias=False)  # 对应公式(18) 中的 W_v
 
         self.value.scale_init = 0
         self.receptance.scale_init = 0
@@ -286,6 +320,10 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
 
 
 class GPTConfig:
+    """
+    模型配置
+    """
+
     def __init__(self, vocab_size, ctx_len, **kwargs):
         self.vocab_size = vocab_size
         self.ctx_len = ctx_len
@@ -294,31 +332,42 @@ class GPTConfig:
 
 
 class Block(nn.Module):
+    """一个RWKV块"""
+
     def __init__(self, config, layer_id):
         super().__init__()
         self.config = config
-        self.layer_id = layer_id
+        self.layer_id = layer_id  # 当前layer的id
 
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
 
         if self.layer_id == 0:
+            # 第一层的时候多做一次LN
             self.ln0 = nn.LayerNorm(config.n_embd)
 
         if self.layer_id == 0 and self.config.model_type == 'RWKV-ffnPre':
+            # todo MODEL == RWKV-ffnPre时 有个单独ffnPre操作，不知道干嘛
             self.ffnPre = RWKV_ChannelMix(config, 0)
         else:
+            # 对应论文time mix 模块
             self.att = RWKV_TimeMix(config, layer_id)
-
+        # 对应论文channel mix模型
         self.ffn = RWKV_ChannelMix(config, layer_id)
 
     def forward(self, x):
+        # 第一层的时候多做一次LN
         if self.layer_id == 0:
             x = self.ln0(x)
+
+        # todo MODEL == RWKV-ffnPre时 有个单独ffnPre操作，不知道干嘛
         if self.layer_id == 0 and self.config.model_type == 'RWKV-ffnPre':
             x = x + self.ffnPre(self.ln1(x))  # better in some cases
         else:
+            # 先LN 后Time mix 再残差
             x = x + self.att(self.ln1(x))
+
+        # 先LN 后channel mix 再残差
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -329,11 +378,14 @@ class GPT(nn.Module):
         self.step = 0
         self.config = config
 
+        # 词向量layer 对应论文模型图的 Input Embedding（粉红色部分）
         self.emb = nn.Embedding(config.vocab_size, config.n_embd)
 
+        # RWKV block layer 对应论文模型图的左边部分
         self.blocks = nn.Sequential(*[Block(config, i)
                                       for i in range(config.n_layer)])
 
+        # Output Probabilities 对应论文模型图的RWKV-LM Head 部分（天蓝色部分）
         self.ln_out = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -345,6 +397,7 @@ class GPT(nn.Module):
             self.register_buffer("copy_mask", torch.tril(
                 torch.ones(config.ctx_len, config.ctx_len)))
 
+        # 文本最大长度
         self.ctx_len = config.ctx_len
 
         try:
@@ -393,14 +446,22 @@ class GPT(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None):
+        # 放入cuda
         idx = idx.to(self.emb.weight.device)
 
+        # 计步
         self.step += 1
         B, T = idx.size()
+        # 判断是否文本长度超过
         assert T <= self.ctx_len, "Cannot forward, because len(input) > model ctx_len."
 
+        # 词嵌入
         x = self.emb(idx)
+
+        # RWKV forward
         x = self.blocks(x)
+
+        # RWKV-LM head forward 的 layernorm
         x = self.ln_out(x)
 
         if RWKV_HEAD_QK_DIM > 0:
@@ -415,13 +476,14 @@ class GPT(nn.Module):
                 c = c @ F.one_hot(idx, num_classes=self.config.vocab_size).half()
             elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
                 c = c @ F.one_hot(idx, num_classes=self.config.vocab_size).bfloat16()
-
+            # RWKV-LM head forward + c todo 不知道是不是在做多头
             x = self.head(x) + c
         else:
+            # RWKV-LM head forward
             x = self.head(x)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(x.view(-1, x.size(-1)), targets.to(x.device).view(-1))
-
+        # todo L2Wrap 不知道在干嘛
         return L2Wrap.apply(loss, x)
