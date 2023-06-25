@@ -1,23 +1,11 @@
-########################################################################################################
-# The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
-########################################################################################################
-
+# model
 import math, os
 import numpy as np
 import logging
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-try:
-    from deepspeed.ops.adam import FusedAdam
-except:
-    pass  # some poor windows users cant install deepspeed
-
-logger = logging.getLogger(__name__)
-
-RWKV_HEAD_QK_DIM = 0
-print(f'\nRWKV_HEAD_QK_DIM {RWKV_HEAD_QK_DIM}\n')
+import config
 
 
 class L2Wrap(torch.autograd.Function):
@@ -40,6 +28,9 @@ class L2Wrap(torch.autograd.Function):
 ########################################################################################################
 # CUDA Kernel
 ########################################################################################################
+local_env = os.environ.copy()
+local_env["PATH"] = r"C:\Users\gy\.conda\envs\torch\Scripts;" + local_env["PATH"]
+os.environ.update(local_env)
 
 T_MAX = 1024  # increase this if your ctx_len is long [NOTE: TAKES LOTS OF VRAM!]
 # it's possible to go beyond CUDA limitations if you slice the ctx and pass the hidden state in each slice
@@ -59,25 +50,21 @@ class WKV(torch.autograd.Function):
         ctx.C = C
         assert T <= T_MAX
         assert B * C % min(C, 1024) == 0
-        if '32' in os.environ['RWKV_FLOAT_MODE']:
-            w = -torch.exp(w.contiguous())
-            u = u.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-        else:
-            w = -torch.exp(w.float().contiguous())
-            u = u.float().contiguous()
-            k = k.float().contiguous()
-            v = v.float().contiguous()
+        w = -torch.exp(w.float().contiguous())
+        u = u.float().contiguous()
+        k = k.float().contiguous()
+        v = v.float().contiguous()
         ctx.save_for_backward(w, u, k, v)
         y = torch.empty((B, T, C), device='cuda', memory_format=torch.contiguous_format)
         wkv_cuda.forward(B, T, C, w, u, k, v, y)
-        if '32' in os.environ['RWKV_FLOAT_MODE']:
-            return y
-        elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
-            return y.half()
-        elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
-            return y.bfloat16()
+        return y
+
+        # if '32' in os.environ['RWKV_FLOAT_MODE']:
+        #     return y
+        # elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
+        #     return y.half()
+        # elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
+        #     return y.bfloat16()
 
     @staticmethod
     def backward(ctx, gy):
@@ -91,93 +78,30 @@ class WKV(torch.autograd.Function):
         gu = torch.zeros((B, C), device='cuda').contiguous()
         gk = torch.zeros((B, T, C), device='cuda').contiguous()
         gv = torch.zeros((B, T, C), device='cuda').contiguous()
-        if '32' in os.environ['RWKV_FLOAT_MODE']:
-            wkv_cuda.backward(B, T, C, w, u, k, v, gy.contiguous(), gw, gu, gk, gv)
-        else:
-            wkv_cuda.backward(B, T, C, w, u, k, v, gy.float().contiguous(), gw, gu, gk, gv)
+        wkv_cuda.backward(B, T, C, w, u, k, v, gy.float().contiguous(), gw, gu, gk, gv)
         gw = torch.sum(gw, dim=0)
         gu = torch.sum(gu, dim=0)
-        if '32' in os.environ['RWKV_FLOAT_MODE']:
-            return (None, None, None, gw, gu, gk, gv)
-        elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
-            return (None, None, None, gw.half(), gu.half(), gk.half(), gv.half())
-        elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
-            return (None, None, None, gw.bfloat16(), gu.bfloat16(), gk.bfloat16(), gv.bfloat16())
+        return (None, None, None, gw, gu, gk, gv)
+
+        #
+        # if '32' in os.environ['RWKV_FLOAT_MODE']:
+        #     return (None, None, None, gw, gu, gk, gv)
+        # elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
+        #     return (None, None, None, gw.half(), gu.half(), gk.half(), gv.half())
+        # elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
+        #     return (None, None, None, gw.bfloat16(), gu.bfloat16(), gk.bfloat16(), gv.bfloat16())
 
 
 def RUN_CUDA(B, T, C, w, u, k, v):
     return WKV.apply(B, T, C, w.cuda(), u.cuda(), k.cuda(), v.cuda())
 
 
-########################################################################################################
-# RWKV: RWKV Time-mix + RWKV Channel-mix
-########################################################################################################
-
-def RWKV_Init(model, args):  # fancy initialization of all lin & emb layer in the model
-    print("\n[--> first run, init model params (very slow for large models) <--]")
-    print("[so you shall only do it for 1 single GPU and save the checkpt and load it when using multiple GPU]\n")
-
-    for mm in model.modules():
-        if "RecursiveScriptModule" in str(type(mm)):
-            if mm.original_name not in ["Linear"]:
-                continue
-            ww = None
-            for name, param in mm.named_parameters():
-                if name == "weight":
-                    ww = param
-        else:
-            m = mm
-            if not isinstance(m, (nn.Linear, nn.Embedding)):
-                continue
-            ww = m.weight
-        with torch.no_grad():
-            name = "[unknown weight]"
-            for name, parameter in model.named_parameters():  # find the name of the weight
-                if id(ww) == id(parameter):
-                    break
-
-            shape = ww.shape
-            gain = 1.0
-            scale = 1.0  # extra scale for gain
-
-            if isinstance(m, nn.Embedding):
-                gain = math.sqrt(max(shape[0], shape[1]))
-                if shape[0] == args.vocab_size and shape[1] == args.n_embd:  # token emb?
-                    scale = 1e-4
-                else:
-                    scale = 0
-
-            if isinstance(m, nn.Linear):
-                if shape[0] > shape[1]:
-                    gain = math.sqrt(shape[0] / shape[1])
-                if shape[0] == args.vocab_size and shape[1] == args.n_embd:  # final projection?
-                    scale = 0.5
-
-            if hasattr(m, "scale_init"):
-                scale = m.scale_init
-
-            # print(f"{str(shape[0]).ljust(5)} {str(shape[1]).ljust(5)} {str(scale).ljust(4)} {name}")
-
-            gain *= scale
-            if scale == -999:
-                nn.init.eye_(ww)
-            elif gain == 0:
-                # zero init is great for some RWKV matrices
-                nn.init.zeros_(ww)
-            elif gain > 0:
-                nn.init.orthogonal_(ww, gain=gain)
-            else:
-                nn.init.normal_(ww, mean=0.0, std=-scale)
-
-
 class RWKV_TimeMix(torch.jit.ScriptModule):
-    def __init__(self, config, layer_id):
+    def __init__(self, layer_id):
         super().__init__()
         self.layer_id = layer_id  # 当前layer id
         self.ctx_len = config.ctx_len  # 最长文本长度
         self.n_embd = config.n_embd  # hidden_state 维度
-
-        attn_sz = config.n_embd  # hidden_state 维度
 
         # todo 附录D中TimeMix的位置编码w、u(mu)、u 的初始化计算方法
         with torch.no_grad():  # fancy init
@@ -190,27 +114,27 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
             ratio_1_to_almost0 = (1.0 - (layer_id / config.n_layer))  # 1 to ~0   u(mu)的  1-（l/L）
 
             # fancy time_decay
-            decay_speed = torch.ones(attn_sz)  # 维度的位置编码 [hidden_state_size]
-            for h in range(attn_sz):  # 按隐藏维度循环每一个位置
+            decay_speed = torch.ones(self.n_embd)  # 维度的位置编码 [hidden_state_size]
+            for h in range(self.n_embd):  # 按隐藏维度循环每一个位置
                 """
                 h 对应 （14） 公式中w_i的i 
                 attn_sz - 1  对应 （14） 公式中w_i的 (d-1)
                 ratio_0_to_1  对应 （14） 公式中w_i的 l / (L - 1)
                 """
-                decay_speed[h] = -5 + 8 * (h / (attn_sz - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
+                decay_speed[h] = -5 + 8 * (h / (self.n_embd - 1)) ** (0.7 + 1.3 * ratio_0_to_1)
             self.time_decay = nn.Parameter(decay_speed)
             # print(layer_id, self.time_decay.flatten()[:3].cpu().numpy(), '...', self.time_decay.flatten()[-3:].cpu().numpy())
 
             # fancy time_first 对应 论文中的bonus
             """
             [(i + 1) % 3 - 1 for i in range(attn_sz)] 对应 （14） 公式中u 的 ((i+1) mod 3) -1
-            
+
             zigzag对应 （14） 公式中u 的 0.5 * ((i+1) mod 3) -1
-            
+
             self.time_first 对应 （14） 公式中u
             """
-            zigzag = (torch.tensor([(i + 1) % 3 - 1 for i in range(attn_sz)]) * 0.5)
-            self.time_first = nn.Parameter(torch.ones(attn_sz) * math.log(0.3) + zigzag)
+            zigzag = (torch.tensor([(i + 1) % 3 - 1 for i in range(self.n_embd)]) * 0.5)
+            self.time_first = nn.Parameter(torch.ones(self.n_embd) * math.log(0.3) + zigzag)
 
             # fancy time_mix 对应公式中的(11-13)
             x = torch.ones(1, 1, config.n_embd)
@@ -227,12 +151,12 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
         # 定义 Wr Wk Wv
-        self.key = nn.Linear(config.n_embd, attn_sz, bias=False)
-        self.value = nn.Linear(config.n_embd, attn_sz, bias=False)
-        self.receptance = nn.Linear(config.n_embd, attn_sz, bias=False)
+        self.key = nn.Linear(config.n_embd, self.n_embd, bias=False)
+        self.value = nn.Linear(config.n_embd, self.n_embd, bias=False)
+        self.receptance = nn.Linear(config.n_embd, self.n_embd, bias=False)
 
         # 定义 Wo
-        self.output = nn.Linear(attn_sz, config.n_embd, bias=False)
+        self.output = nn.Linear(self.n_embd, config.n_embd, bias=False)
 
         # todo 不懂
         self.key.scale_init = 0
@@ -272,7 +196,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
 
 
 class RWKV_ChannelMix(torch.jit.ScriptModule):
-    def __init__(self, config, layer_id):
+    def __init__(self, layer_id):
         super().__init__()
         self.layer_id = layer_id  # layer id
 
@@ -319,29 +243,11 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         return rkv
 
 
-########################################################################################################
-# The GPT Model with our blocks
-########################################################################################################
-
-
-class GPTConfig:
-    """
-    模型配置
-    """
-
-    def __init__(self, vocab_size, ctx_len, **kwargs):
-        self.vocab_size = vocab_size
-        self.ctx_len = ctx_len
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
 class Block(nn.Module):
     """一个RWKV块"""
 
-    def __init__(self, config, layer_id):
+    def __init__(self, layer_id):
         super().__init__()
-        self.config = config
         self.layer_id = layer_id  # 当前layer的id
 
         self.ln1 = nn.LayerNorm(config.n_embd)
@@ -351,71 +257,73 @@ class Block(nn.Module):
             # 第一层的时候多做一次LN
             self.ln0 = nn.LayerNorm(config.n_embd)
 
-        if self.layer_id == 0 and self.config.model_type == 'RWKV-ffnPre':
-            # todo MODEL == RWKV-ffnPre时 有个单独ffnPre操作，不知道干嘛
-            self.ffnPre = RWKV_ChannelMix(config, 0)
-        else:
-            # 对应论文time mix 模块
-            self.att = RWKV_TimeMix(config, layer_id)
+        # 对应论文time mix 模块
+        self.time_mix = RWKV_TimeMix(layer_id)
         # 对应论文channel mix模型
-        self.ffn = RWKV_ChannelMix(config, layer_id)
+        self.channel_mix = RWKV_ChannelMix(layer_id)
 
     def forward(self, x):
         # 第一层的时候多做一次LN
         if self.layer_id == 0:
             x = self.ln0(x)
 
-        # todo MODEL == RWKV-ffnPre时 有个单独ffnPre操作，不知道干嘛
-        if self.layer_id == 0 and self.config.model_type == 'RWKV-ffnPre':
-            x = x + self.ffnPre(self.ln1(x))  # better in some cases
-        else:
-            # 先LN 后Time mix 再残差
-            x = x + self.att(self.ln1(x))
+        # 先LN 后Time mix 再残差
+        x = x + self.time_mix(self.ln1(x))
 
         # 先LN 后channel mix 再残差
-        x = x + self.ffn(self.ln2(x))
+        x = x + self.channel_mix(self.ln2(x))
         return x
 
 
-class GPT(nn.Module):
-    def __init__(self, config):
+class RGM(nn.Module):
+    def __init__(self, vocab_size):
         super().__init__()
         self.step = 0
-        self.config = config
-
-        # 词向量layer 对应论文模型图的 Input Embedding（粉红色部分）
-        self.emb = nn.Embedding(config.vocab_size, config.n_embd)
-
-        # RWKV block layer 对应论文模型图的左边部分
-        self.blocks = nn.Sequential(*[Block(config, i)
-                                      for i in range(config.n_layer)])
-
-        # Output Probabilities 对应论文模型图的RWKV-LM Head 部分（天蓝色部分）
-        self.ln_out = nn.LayerNorm(config.n_embd)
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        if RWKV_HEAD_QK_DIM > 0:
-            self.head_q = nn.Linear(config.n_embd, RWKV_HEAD_QK_DIM, bias=False)
-            self.head_q.scale_init = 0
-            self.head_k = nn.Linear(config.n_embd, RWKV_HEAD_QK_DIM, bias=False)
-            self.head_k.scale_init = 0.1
-            self.register_buffer("copy_mask", torch.tril(
-                torch.ones(config.ctx_len, config.ctx_len)))
+        self.vocab_size = vocab_size
 
         # 文本最大长度
         self.ctx_len = config.ctx_len
 
-        try:
-            if os.environ['RWKV_LOAD_MODEL'] == str(False):
-                RWKV_Init(self, config)
-        except:
-            pass
+        # 词向量layer 对应论文模型图的 Input Embedding（粉红色部分）
+        self.emb = nn.Embedding(self.vocab_size, config.n_embd)
 
-        logger.info("number of parameters: %e", sum(p.numel()
-                                                    for p in self.parameters()))
+        # RWKV block layer 对应论文模型图的左边部分
+        self.blocks = nn.Sequential(*[Block(i)
+                                      for i in range(config.n_layer)])
 
-    def get_ctx_len(self):
-        return self.ctx_len
+        # Output Probabilities 对应论文模型图的RWKV-LM Head 部分（天蓝色部分）
+        self.ln_out = nn.LayerNorm(config.n_embd)
+        self.head = nn.Linear(config.n_embd, self.vocab_size, bias=False)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.size()
+        # 判断是否文本长度超过
+        assert T <= self.ctx_len, "Cannot forward, because len(input) > model ctx_len."
+
+        # 放入cuda
+        idx = idx.to(config.device)
+
+        # 计步
+        self.step += 1
+
+        # 词嵌入
+        x = self.emb(idx)
+
+        # RWKV forward
+        x = self.blocks(x)
+
+        # RWKV-LM head forward 的 layernorm
+        x = self.ln_out(x)
+
+        # RWKV-LM head forward
+        x = self.head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(x.view(-1, x.size(-1)), targets.to(x.device).view(-1))
+        # todo L2Wrap 不知道在干嘛
+        return L2Wrap.apply(loss, x)
+
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear)):
@@ -425,7 +333,7 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-    def configure_optimizers(self, train_config):
+    def configure_optimizers(self):
         no_decay = set()
 
         for mn, m in self.named_modules():  # here we disable weight_decay
@@ -439,56 +347,18 @@ class GPT(nn.Module):
                         for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
 
-        try:
-            optimizer = FusedAdam(optim_groups, lr=train_config.learning_rate, betas=train_config.betas,
-                                  eps=train_config.eps, bias_correction=True, adam_w_mode=False, weight_decay=0,
-                                  amsgrad=False)
-        except:
-            print('\n\nDeepSpeed not found. Using torch optimizer instead (probably slower)\n\n')
-            optimizer = torch.optim.Adam(optim_groups, lr=train_config.learning_rate, betas=train_config.betas,
-                                         eps=train_config.eps)
+        # todo FusedAdam    from deepspeed.ops.adam import FusedAdam
+        # try:
+        #     optimizer = FusedAdam(optim_groups, lr=train_config.learning_rate, betas=train_config.betas,
+        #                           eps=train_config.eps, bias_correction=True, adam_w_mode=False, weight_decay=0,
+        #                           amsgrad=False)
+        # except:
+        #     print('\n\nDeepSpeed not found. Using torch optimizer instead (probably slower)\n\n')
+        #     optimizer = torch.optim.Adam(optim_groups, lr=train_config.learning_rate, betas=train_config.betas,
+        #                                  eps=train_config.eps)
+
+        print('\n\nDeepSpeed not found. Using torch optimizer instead (probably slower)\n\n')
+        optimizer = torch.optim.Adam(optim_groups, lr=config.lr, betas=config.betas,
+                                     eps=config.eps)
 
         return optimizer
-
-    def forward(self, idx, targets=None):
-        # 放入cuda
-        idx = idx.to(self.emb.weight.device)
-
-        # 计步
-        self.step += 1
-        B, T = idx.size()
-        # 判断是否文本长度超过
-        assert T <= self.ctx_len, "Cannot forward, because len(input) > model ctx_len."
-
-        # 词嵌入
-        x = self.emb(idx)
-
-        # RWKV forward
-        x = self.blocks(x)
-
-        # RWKV-LM head forward 的 layernorm
-        x = self.ln_out(x)
-
-        if RWKV_HEAD_QK_DIM > 0:
-            q = self.head_q(x)[:, :T, :]
-            k = self.head_k(x)[:, :T, :]
-            c = (q @ k.transpose(-2, -1)) * (1.0 / RWKV_HEAD_QK_DIM)
-            c = c.masked_fill(self.copy_mask[:T, :T] == 0, 0)
-
-            if '32' in os.environ['RWKV_FLOAT_MODE']:
-                c = c @ F.one_hot(idx, num_classes=self.config.vocab_size)
-            elif os.environ['RWKV_FLOAT_MODE'] == 'fp16':
-                c = c @ F.one_hot(idx, num_classes=self.config.vocab_size).half()
-            elif os.environ['RWKV_FLOAT_MODE'] == 'bf16':
-                c = c @ F.one_hot(idx, num_classes=self.config.vocab_size).bfloat16()
-            # RWKV-LM head forward + c todo 不知道是不是在做多头
-            x = self.head(x) + c
-        else:
-            # RWKV-LM head forward
-            x = self.head(x)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(x.view(-1, x.size(-1)), targets.to(x.device).view(-1))
-        # todo L2Wrap 不知道在干嘛
-        return L2Wrap.apply(loss, x)

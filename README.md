@@ -1,36 +1,33 @@
+# version_2
+RGM
+
+
+
 # RWKV_xy
 
-RWKV_xy is a test project, focusing primarily on RWKV.
+RWKV_xy 是一个测试项目，主要涉及C++和CUDA的编程和应用。
 
-## The first step make the code run!
-![image](https://github.com/uglyghost/RWKV_xy/assets/15159177/1a15ad4a-6e34-42b5-922e-1d72f2d42de0)
+## 配置环境
 
-## The second step optimize the model framework!
--_-
+请按照以下步骤安装并设置您的环境：
 
-## Environment Setup
+### 工具安装
 
-Please follow these steps to install and setup your environment:
+1. 安装VS2022构建工具，你可以在以下链接中下载：https://aka.ms/vs/17/release/vs_BuildTools.exe  选择桌面版C++。
+2. 重新安装CUDA 11.7，记得安装VC++扩展。
 
-### Tools Installation
+### 执行脚本
 
-1. Install VS2022 build tools. They can be downloaded from the following link: https://aka.ms/vs/17/release/vs_BuildTools.exe. Select Desktop C++.
-2. Reinstall CUDA 11.7 and make sure to install the VC++ extensions.
+使用"x64 native tools command prompt"（在开始菜单中找到）运行`train.py` or `main.py`。
 
-### Script Execution
+### 环境变量设置
 
-Run `main.py` or `train.py` using the "x64 native tools command prompt", which can be found in your start menu.
+在Windows 11操作系统中，请按照以下步骤设置环境变量：
 
-### Setting Environment Variables
+1. LD_LIBRARY_PATH 设置为 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7\lib\x64`
+2. PATH 设置为 `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.35.32215\bin\Hostx64\x64`
 
-On Windows 11, please set your environment variables as follows:
+## C++ 代码
 
-- Set `LD_LIBRARY_PATH` to `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.7\lib\x64`
-- Add `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.35.32215\bin\Hostx64\x64` to `PATH`
+请仔细阅读`./c++/RWKV-CUDA-main`内的内容以更好地理解C++的应用。
 
-
-## C++ Code
-
-Please read through `./c++/RWKV-CUDA-main` carefully to better understand the application of C++. 
-
-Please feel free to contact us if you encounter any issues or have any suggestions.
